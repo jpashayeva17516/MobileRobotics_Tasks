@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+import ev3dev.ev3 as ev3
+import time
+import sys
+import csv
+
+try:
+    left_motor = ev3.LargeMotor('outB')
+    right_motor = ev3.LargeMotor('outC')
+    us_sensor = ev3.UltrasonicSensor('in3')
+    color_sensor = ev3.ColorSensor('in1')
+except Exception as e:
+    print("Error: Hardware port mismatch!")
+    print(str(e))
+    print("Check ports: B, C, in1, in3")
+    time.sleep(10)
+    sys.exit()
+
+color_sensor.mode = 'COL-REFLECT' 
+us_sensor.mode = 'US-DIST-CM'
+
+BLACK_VALUE = 8.0
+WHITE_VALUE = 71.0
+TARGET_LIGHT = 32.0 
+
+print("=" * 40)
+print("STATIC CALIBRATION:")
+print("  BLACK: {:.1f}".format(BLACK_VALUE))
+print("  WHITE: {:.1f}".format(WHITE_VALUE))
+print("  TARGET: {:.1f}".format(TARGET_LIGHT))
+
+EDGE_TOLERANCE = (WHITE_VALUE - BLACK_VALUE) * 0.25
+LOST_THRESHOLD = TARGET_LIGHT + EDGE_TOLERANCE
+FOUND_THRESHOLD = TARGET_LIGHT - EDGE_TOLERANCE
+
+print("\nThresholds:")
+print("  FOUND LINE: < {:.1f}".format(FOUND_THRESHOLD))
+print("  LOST LINE: > {:.1f}".format(LOST_THRESHOLD))
+print("=" * 40)
+print()
+time.sleep(2) 
+
+Kp = 1.0
+Kd = 4.5
+
+last_error = 0
+
+BASE_SPEED = 180
+SEARCH_SPEED = 250
+STOP_DISTANCE_CM = 4 
+MAX_MOTOR_SPEED = 1000
+
+LOST_LINE_DELAY = 0.3
+SEARCH_DURATION = 0.8
+TURN_180_MS = 1100
+
+data_log = []
+start_time = time.time()
+
+def save_data_to_csv(data, filename="sensor_log.csv"):
+    print("\nSaving data to {}...".format(filename))
+    try:
+        with open(filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["time", "reflection", "left_speed", "right_speed", "correction", "state"])
+            writer.writerows(data)
+        print("Data saved successfully.")
+    except Exception as e:
+        print("Error saving CSV: {}".format(e))
+
+STATE_FOLLOWING = "FOLLOWING"
+STATE_LOST = "LOST"
+STATE_SEARCHING = "SEARCHING"
+STATE_OBSTACLE = "OBSTACLE"
+STATE_CROSS = "CROSS"
+
+current_state = STATE_FOLLOWING
+last_known_side = 0
+lost_line_time = None
+
+MAZE_COMPLETED = False
+OBSTACLE_SEEN = False 
+
+def search_for_line(direction):
+    global current_state
+    
+    side_name = "LEFT" if direction < 0 else "RIGHT"
+    print("Searching {} for line...".format(side_name))
+    
+    left_motor.run_forever(speed_sp=SEARCH_SPEED * direction)
+    right_motor.run_forever(speed_sp=-SEARCH_SPEED * direction)
+    
+    search_start = time.time()
+    while time.time() - search_start < SEARCH_DURATION:
+        light = color_sensor.reflected_light_intensity
+        
+        if light < FOUND_THRESHOLD:
+            left_motor.stop(stop_action="brake")
+            right_motor.stop(stop_action="brake")
+            print("Line FOUND on {}!".format(side_name))
+            return True
+        
+        time.sleep(0.02)
+    
+    left_motor.stop(stop_action="brake")
+    right_motor.stop(stop_action="brake")
+    time.sleep(0.1)
+    
+    left_motor.run_timed(
+        time_sp=int(SEARCH_DURATION * 1000), 
+        speed_sp=-SEARCH_SPEED * direction,
+        stop_action="brake"
+    )
+    right_motor.run_timed(
+        time_sp=int(SEARCH_DURATION * 1000), 
+        speed_sp=SEARCH_SPEED * direction,
+        stop_action="brake"
+    )
+    left_motor.wait_while('running')
+    right_motor.wait_while('running')
+    
+    return False
+
+def turn_around_180():
+    global last_error
+    
+    left_motor.run_timed(time_sp=TURN_180_MS, speed_sp=350, stop_action="brake")
+    right_motor.run_timed(time_sp=TURN_180_MS, speed_sp=-350, stop_action="brake")
+    left_motor.wait_while('running')
+    right_motor.wait_while('running')
+    
+    last_error = 0
+    
+def handle_lost_line():
+    global last_error, current_state, last_known_side, MAZE_COMPLETED, OBSTACLE_SEEN
+    
+    print("\n!!! LINE LOST !!!")
+    current_state = STATE_SEARCHING
+    
+    left_motor.stop(stop_action="brake")
+    right_motor.stop(stop_action="brake")
+    time.sleep(0.2)
+    
+    if last_known_side != 0:
+        if search_for_line(last_known_side):
+            last_error = 0
+            current_state = STATE_FOLLOWING
+            return
+    
+    opposite_side = -last_known_side if last_known_side != 0 else 1
+    if search_for_line(opposite_side):
+        last_known_side = opposite_side
+        last_error = 0
+        current_state = STATE_FOLLOWING
+        return
+    
+    if OBSTACLE_SEEN:
+        print("Line not found AND obstacle was seen. Assuming MAZE END.")
+        left_motor.stop(stop_action="brake")
+        right_motor.stop(stop_action="brake")
+        MAZE_COMPLETED = True 
+    else:
+        print("Line not found. Assuming DEAD END. Turning around...")
+        turn_around_180()
+        
+        print("Searching for line after 180 turn...")
+        if search_for_line(1):
+            last_known_side = 1
+        elif search_for_line(-1):
+            last_known_side = -1
+        else:
+            print("CRITICAL: Still no line after 180 turn. Stopping.")
+            MAZE_COMPLETED = True 
+            
+    last_error = 0
+
+def handle_cross_line():
+    global last_error, current_state
+    
+    print("Cross line detected!")
+    current_state = STATE_CROSS
+    
+    left_motor.run_timed(time_sp=400, speed_sp=BASE_SPEED, stop_action="brake")
+    right_motor.run_timed(time_sp=400, speed_sp=BASE_SPEED, stop_action="brake")
+    left_motor.wait_while('running')
+    right_motor.wait_while('running')
+    
+    last_error = 0
+    current_state = STATE_FOLLOWING
+
+print("\nStarting main loop...")
+print("Press Ctrl+C to stop\n")
+
+try:
+    while not MAZE_COMPLETED:
+        distance = us_sensor.value() / 10.0
+
+        if distance < STOP_DISTANCE_CM:
+            if current_state != STATE_OBSTACLE:
+                print("OBSTACLE detected at {:.1f}cm".format(distance))
+                current_state = STATE_OBSTACLE
+                OBSTACLE_SEEN = True 
+                
+            left_motor.stop(stop_action="brake")
+            right_motor.stop(stop_action="brake")
+            
+            last_error = 0
+            lost_line_time = None
+            
+            time.sleep(0.1)
+            continue
+        
+        if current_state == STATE_OBSTACLE:
+            print("Obstacle cleared. Resuming...")
+            current_state = STATE_FOLLOWING
+        
+        current_light = color_sensor.reflected_light_intensity
+        
+        if current_light < BLACK_VALUE + 3:
+            handle_cross_line()
+            continue
+        
+        if current_light > LOST_THRESHOLD:
+            if lost_line_time is None:
+                lost_line_time = time.time()
+            elif time.time() - lost_line_time > LOST_LINE_DELAY:
+                handle_lost_line()
+                lost_line_time = None
+                continue 
+        else:
+            lost_line_time = None
+            if current_state == STATE_SEARCHING:
+                current_state = STATE_FOLLOWING
+        
+        if current_state != STATE_FOLLOWING:
+            time.sleep(0.01)
+            continue
+            
+        error = current_light - TARGET_LIGHT
+        
+        if abs(error) > 5:
+            last_known_side = 1 if error > 0 else -1
+        
+        derivative = error - last_error
+        correction = (Kp * error) + (Kd * derivative)
+        last_error = error
+        
+        left_speed = BASE_SPEED - correction
+        right_speed = BASE_SPEED + correction
+        
+        left_speed = max(-MAX_MOTOR_SPEED, min(left_speed, MAX_MOTOR_SPEED))
+        right_speed = max(-MAX_MOTOR_SPEED, min(right_speed, MAX_MOTOR_SPEED))
+        
+        left_motor.run_forever(speed_sp=left_speed)
+        right_motor.run_forever(speed_sp=right_speed)
+        
+        elapsed = time.time() - start_time
+        data_log.append([
+            elapsed, 
+            current_light, 
+            left_speed, 
+            right_speed, 
+            correction,
+            current_state
+        ])
+        
+        time.sleep(0.01)
+
+except KeyboardInterrupt:
+    print("\n\nProgram stopped by user.")
+finally:
+    print("\nShutting down...")
+    left_motor.stop(stop_action="brake")
+    right_motor.stop(stop_action="brake")
+    save_data_to_csv(data_log)
+    print("Done.")
