@@ -5,272 +5,269 @@ import sys
 import csv
 
 try:
-    left_motor = ev3.LargeMotor('outB')
-    right_motor = ev3.LargeMotor('outC')
-    us_sensor = ev3.UltrasonicSensor('in3')
-    color_sensor = ev3.ColorSensor('in1')
+    motor_L = ev3.LargeMotor('outB')
+    motor_R = ev3.LargeMotor('outC')
+    light_sensor = ev3.ColorSensor('in1') 
+    dist_sensor = ev3.UltrasonicSensor('in3')
 except Exception as e:
-    print("Error: Hardware port mismatch!")
+    print("FATAL: Hardware Port Mismatch!")
     print(str(e))
-    print("Check ports: B, C, in1, in3")
+    print("Please check: Left Motor (B), Right Motor (C), Color (1), Ultrasonic (3)")
     time.sleep(10)
     sys.exit()
 
-color_sensor.mode = 'COL-REFLECT' 
-us_sensor.mode = 'US-DIST-CM'
+light_sensor.mode = 'COL-REFLECT'
+dist_sensor.mode = 'US-DIST-CM'
 
-BLACK_VALUE = 8.0
-WHITE_VALUE = 71.0
-TARGET_LIGHT = 32.0 
+CAL_BLACK = 8.0
+CAL_WHITE = 71.0
+CAL_TARGET = 32.0 
 
-print("=" * 40)
-print("STATIC CALIBRATION:")
-print("  BLACK: {:.1f}".format(BLACK_VALUE))
-print("  WHITE: {:.1f}".format(WHITE_VALUE))
-print("  TARGET: {:.1f}".format(TARGET_LIGHT))
+GAIN_PROP = 1.0
+GAIN_DERIV = 4.5
 
-EDGE_TOLERANCE = (WHITE_VALUE - BLACK_VALUE) * 0.25
-LOST_THRESHOLD = TARGET_LIGHT + EDGE_TOLERANCE
-FOUND_THRESHOLD = TARGET_LIGHT - EDGE_TOLERANCE
+FWD_SPEED = 180
+SEARCH_TURN_SPEED = 250
+OBSTACLE_THRESH_CM = 4
+MAX_MOTOR_SPEED_SP = 1000
 
-print("\nThresholds:")
-print("  FOUND LINE: < {:.1f}".format(FOUND_THRESHOLD))
-print("  LOST LINE: > {:.1f}".format(LOST_THRESHOLD))
-print("=" * 40)
-print()
-time.sleep(2) 
+LOST_TIMER_DURATION = 0.3
+SWEEP_DURATION_MS = 800
+TURN_180_DURATION_MS = 1100
 
-Kp = 1.0
-Kd = 4.5
+EDGE_TOLERANCE_BAND = (CAL_WHITE - CAL_BLACK) * 0.25
+THRESH_LOST = CAL_TARGET + EDGE_TOLERANCE_BAND
+THRESH_FOUND = CAL_TARGET - EDGE_TOLERANCE_BAND
 
-last_error = 0
+MODE_FOLLOW = "FOLLOW"
+MODE_SEARCH = "SEARCH"
+MODE_OBSTACLE = "OBSTACLE"
+MODE_INTERSECTION = "CROSS"
 
-BASE_SPEED = 180
-SEARCH_SPEED = 250
-STOP_DISTANCE_CM = 4 
-MAX_MOTOR_SPEED = 1000
+current_mode = MODE_FOLLOW
+prev_error = 0.0
+last_seen_direction = 0
+time_line_lost_at = None
+is_mission_complete = False
+has_seen_obstacle = False
 
-LOST_LINE_DELAY = 0.3
-SEARCH_DURATION = 0.8
-TURN_180_MS = 1100
+telemetry_log = []
+session_start_time = time.time()
 
-data_log = []
-start_time = time.time()
-
-def save_data_to_csv(data, filename="sensor_log.csv"):
-    print("\nSaving data to {}...".format(filename))
+def export_log_to_csv(log_data, filename="robot_telemetry.csv"):
+    print("\nExporting telemetry to {}...".format(filename))
     try:
         with open(filename, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["time", "reflection", "left_speed", "right_speed", "correction", "state"])
-            writer.writerows(data)
-        print("Data saved successfully.")
+            writer.writerow([
+                "timestamp", "reflection", "motor_L_speed", 
+                "motor_R_speed", "steering_adj", "robot_mode"
+            ])
+            writer.writerows(log_data)
+        print("Telemetry saved successfully.")
     except Exception as e:
         print("Error saving CSV: {}".format(e))
 
-STATE_FOLLOWING = "FOLLOWING"
-STATE_LOST = "LOST"
-STATE_SEARCHING = "SEARCHING"
-STATE_OBSTACLE = "OBSTACLE"
-STATE_CROSS = "CROSS"
-
-current_state = STATE_FOLLOWING
-last_known_side = 0
-lost_line_time = None
-
-MAZE_COMPLETED = False
-OBSTACLE_SEEN = False 
-
-def search_for_line(direction):
-    global current_state
+def find_line_sweep(sweep_direction):
+    global current_mode
+    current_mode = MODE_SEARCH
     
-    side_name = "LEFT" if direction < 0 else "RIGHT"
-    print("Searching {} for line...".format(side_name))
+    dir_name = "LEFT" if sweep_direction < 0 else "RIGHT"
+    print("Sweeping {} to find line...".format(dir_name))
     
-    left_motor.run_forever(speed_sp=SEARCH_SPEED * direction)
-    right_motor.run_forever(speed_sp=-SEARCH_SPEED * direction)
+    motor_L.run_timed(
+        time_sp=SWEEP_DURATION_MS,
+        speed_sp=SEARCH_TURN_SPEED * sweep_direction,
+        stop_action="brake"
+    )
+    motor_R.run_timed(
+        time_sp=SWEEP_DURATION_MS,
+        speed_sp=-SEARCH_TURN_SPEED * sweep_direction,
+        stop_action="brake"
+    )
     
-    search_start = time.time()
-    while time.time() - search_start < SEARCH_DURATION:
-        light = color_sensor.reflected_light_intensity
-        
-        if light < FOUND_THRESHOLD:
-            left_motor.stop(stop_action="brake")
-            right_motor.stop(stop_action="brake")
-            print("Line FOUND on {}!".format(side_name))
+    while motor_L.is_running:
+        reflection = light_sensor.reflected_light_intensity
+        if reflection < THRESH_FOUND:
+            motor_L.stop(stop_action="brake")
+            motor_R.stop(stop_action="brake")
+            print("Line FOUND on {}!".format(dir_name))
             return True
+        time.sleep(0.01)
         
-        time.sleep(0.02)
+    print("Line NOT found on {}.".format(dir_name))
     
-    left_motor.stop(stop_action="brake")
-    right_motor.stop(stop_action="brake")
-    time.sleep(0.1)
-    
-    left_motor.run_timed(
-        time_sp=int(SEARCH_DURATION * 1000), 
-        speed_sp=-SEARCH_SPEED * direction,
+    motor_L.run_timed(
+        time_sp=SWEEP_DURATION_MS,
+        speed_sp=-SEARCH_TURN_SPEED * sweep_direction,
         stop_action="brake"
     )
-    right_motor.run_timed(
-        time_sp=int(SEARCH_DURATION * 1000), 
-        speed_sp=SEARCH_SPEED * direction,
+    motor_R.run_timed(
+        time_sp=SWEEP_DURATION_MS,
+        speed_sp=SEARCH_TURN_SPEED * sweep_direction,
         stop_action="brake"
     )
-    left_motor.wait_while('running')
-    right_motor.wait_while('running')
+    motor_L.wait_while('running')
+    motor_R.wait_while('running')
     
     return False
 
-def turn_around_180():
-    global last_error
+def perform_180_turn():
+    global prev_error
+    print("Dead end. Executing 180-degree turn...")
     
-    left_motor.run_timed(time_sp=TURN_180_MS, speed_sp=350, stop_action="brake")
-    right_motor.run_timed(time_sp=TURN_180_MS, speed_sp=-350, stop_action="brake")
-    left_motor.wait_while('running')
-    right_motor.wait_while('running')
+    motor_L.run_timed(
+        time_sp=TURN_180_DURATION_MS, 
+        speed_sp=350, 
+        stop_action="brake"
+    )
+    motor_R.run_timed(
+        time_sp=TURN_180_DURATION_MS, 
+        speed_sp=-350, 
+        stop_action="brake"
+    )
+    motor_L.wait_while('running')
+    motor_R.wait_while('running')
+    prev_error = 0.0
+
+def recover_from_line_loss():
+    global prev_error, current_mode, last_seen_direction
+    global is_mission_complete, has_seen_obstacle
     
-    last_error = 0
-    
-def handle_lost_line():
-    global last_error, current_state, last_known_side, MAZE_COMPLETED, OBSTACLE_SEEN
-    
-    print("\n!!! LINE LOST !!!")
-    current_state = STATE_SEARCHING
-    
-    left_motor.stop(stop_action="brake")
-    right_motor.stop(stop_action="brake")
+    print("\n--- LINE LOST ---")
+    current_mode = MODE_SEARCH
+    motor_L.stop(stop_action="brake")
+    motor_R.stop(stop_action="brake")
     time.sleep(0.2)
     
-    if last_known_side != 0:
-        if search_for_line(last_known_side):
-            last_error = 0
-            current_state = STATE_FOLLOWING
+    if last_seen_direction != 0:
+        if find_line_sweep(last_seen_direction):
+            prev_error = 0.0
+            current_mode = MODE_FOLLOW
             return
-    
-    opposite_side = -last_known_side if last_known_side != 0 else 1
-    if search_for_line(opposite_side):
-        last_known_side = opposite_side
-        last_error = 0
-        current_state = STATE_FOLLOWING
+            
+    opposite_direction = -last_seen_direction if last_seen_direction != 0 else 1
+    if find_line_sweep(opposite_direction):
+        last_seen_direction = opposite_direction
+        prev_error = 0.0
+        current_mode = MODE_FOLLOW
         return
-    
-    if OBSTACLE_SEEN:
+        
+    if has_seen_obstacle:
         print("Line not found AND obstacle was seen. Assuming MAZE END.")
-        left_motor.stop(stop_action="brake")
-        right_motor.stop(stop_action="brake")
-        MAZE_COMPLETED = True 
+        is_mission_complete = True
     else:
-        print("Line not found. Assuming DEAD END. Turning around...")
-        turn_around_180()
+        perform_180_turn()
         
         print("Searching for line after 180 turn...")
-        if search_for_line(1):
-            last_known_side = 1
-        elif search_for_line(-1):
-            last_known_side = -1
+        if find_line_sweep(1):
+            last_seen_direction = 1
+        elif find_line_sweep(-1):
+            last_seen_direction = -1
         else:
             print("CRITICAL: Still no line after 180 turn. Stopping.")
-            MAZE_COMPLETED = True 
+            is_mission_complete = True
             
-    last_error = 0
+    prev_error = 0.0
+    current_mode = MODE_FOLLOW
 
-def handle_cross_line():
-    global last_error, current_state
+def navigate_intersection():
+    global prev_error, current_mode
     
-    print("Cross line detected!")
-    current_state = STATE_CROSS
+    print("Intersection (cross-line) detected.")
+    current_mode = MODE_INTERSECTION
     
-    left_motor.run_timed(time_sp=400, speed_sp=BASE_SPEED, stop_action="brake")
-    right_motor.run_timed(time_sp=400, speed_sp=BASE_SPEED, stop_action="brake")
-    left_motor.wait_while('running')
-    right_motor.wait_while('running')
+    motor_L.run_timed(time_sp=400, speed_sp=FWD_SPEED, stop_action="brake")
+    motor_R.run_timed(time_sp=400, speed_sp=FWD_SPEED, stop_action="brake")
+    motor_L.wait_while('running')
+    motor_R.wait_while('running')
     
-    last_error = 0
-    current_state = STATE_FOLLOWING
+    prev_error = 0.0
+    current_mode = MODE_FOLLOW
 
-print("\nStarting main loop...")
-print("Press Ctrl+C to stop\n")
+print("\nStarting Main Control Loop...")
+print("Press Ctrl+C to stop the program.\n")
 
 try:
-    while not MAZE_COMPLETED:
-        distance = us_sensor.value() / 10.0
-
-        if distance < STOP_DISTANCE_CM:
-            if current_state != STATE_OBSTACLE:
-                print("OBSTACLE detected at {:.1f}cm".format(distance))
-                current_state = STATE_OBSTACLE
-                OBSTACLE_SEEN = True 
-                
-            left_motor.stop(stop_action="brake")
-            right_motor.stop(stop_action="brake")
+    while not is_mission_complete:
+        
+        distance_cm = dist_sensor.value() / 10.0
+        
+        if distance_cm < OBSTACLE_THRESH_CM:
+            if current_mode != MODE_OBSTACLE:
+                print("OBSTACLE detected at {:.1f}cm".format(distance_cm))
+                current_mode = MODE_OBSTACLE
+                has_seen_obstacle = True
             
-            last_error = 0
-            lost_line_time = None
+            motor_L.stop(stop_action="brake")
+            motor_R.stop(stop_action="brake")
+            prev_error = 0.0
+            time_line_lost_at = None
             
             time.sleep(0.1)
             continue
+            
+        if current_mode == MODE_OBSTACLE:
+            print("Obstacle cleared. Resuming line following.")
+            current_mode = MODE_FOLLOW
+            
+        reflection = light_sensor.reflected_light_intensity
         
-        if current_state == STATE_OBSTACLE:
-            print("Obstacle cleared. Resuming...")
-            current_state = STATE_FOLLOWING
-        
-        current_light = color_sensor.reflected_light_intensity
-        
-        if current_light < BLACK_VALUE + 3:
-            handle_cross_line()
+        if reflection < (CAL_BLACK + 3):
+            navigate_intersection()
             continue
-        
-        if current_light > LOST_THRESHOLD:
-            if lost_line_time is None:
-                lost_line_time = time.time()
-            elif time.time() - lost_line_time > LOST_LINE_DELAY:
-                handle_lost_line()
-                lost_line_time = None
-                continue 
+            
+        if reflection > THRESH_LOST:
+            if time_line_lost_at is None:
+                time_line_lost_at = time.time()
+            elif (time.time() - time_line_lost_at) > LOST_TIMER_DURATION:
+                recover_from_line_loss()
+                time_line_lost_at = None
+                continue
         else:
-            lost_line_time = None
-            if current_state == STATE_SEARCHING:
-                current_state = STATE_FOLLOWING
-        
-        if current_state != STATE_FOLLOWING:
+            time_line_lost_at = None
+            if current_mode == MODE_SEARCH:
+                current_mode = MODE_FOLLOW
+                
+        if current_mode != MODE_FOLLOW:
             time.sleep(0.01)
             continue
             
-        error = current_light - TARGET_LIGHT
+        p_error = reflection - CAL_TARGET
         
-        if abs(error) > 5:
-            last_known_side = 1 if error > 0 else -1
+        if abs(p_error) > 5:
+            last_seen_direction = 1 if p_error > 0 else -1
+            
+        d_error = p_error - prev_error
+        steering_adj = (GAIN_PROP * p_error) + (GAIN_DERIV * d_error)
+        prev_error = p_error
         
-        derivative = error - last_error
-        correction = (Kp * error) + (Kd * derivative)
-        last_error = error
+        speed_L = FWD_SPEED - steering_adj
+        speed_R = FWD_SPEED + steering_adj
         
-        left_speed = BASE_SPEED - correction
-        right_speed = BASE_SPEED + correction
+        speed_L = max(-MAX_MOTOR_SPEED_SP, min(speed_L, MAX_MOTOR_SPEED_SP))
+        speed_R = max(-MAX_MOTOR_SPEED_SP, min(speed_R, MAX_MOTOR_SPEED_SP))
         
-        left_speed = max(-MAX_MOTOR_SPEED, min(left_speed, MAX_MOTOR_SPEED))
-        right_speed = max(-MAX_MOTOR_SPEED, min(right_speed, MAX_MOTOR_SPEED))
+        motor_L.run_forever(speed_sp=speed_L)
+        motor_R.run_forever(speed_sp=speed_R)
         
-        left_motor.run_forever(speed_sp=left_speed)
-        right_motor.run_forever(speed_sp=right_speed)
-        
-        elapsed = time.time() - start_time
-        data_log.append([
-            elapsed, 
-            current_light, 
-            left_speed, 
-            right_speed, 
-            correction,
-            current_state
+        timestamp = time.time() - session_start_time
+        telemetry_log.append([
+            timestamp, 
+            reflection, 
+            speed_L, 
+            speed_R, 
+            steering_adj,
+            current_mode
         ])
         
         time.sleep(0.01)
 
 except KeyboardInterrupt:
-    print("\n\nProgram stopped by user.")
+    print("\n\nProgram terminated by user (Ctrl+C).")
 finally:
-    print("\nShutting down...")
-    left_motor.stop(stop_action="brake")
-    right_motor.stop(stop_action="brake")
-    save_data_to_csv(data_log)
-    print("Done.")
+    print("\nShutting down motors and saving data...")
+    motor_L.stop(stop_action="brake")
+    motor_R.stop(stop_action="brake")
+    export_log_to_csv(telemetry_log)
+    print("Cleanup complete.")
